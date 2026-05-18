@@ -1,146 +1,22 @@
-[ai_coach.py](https://github.com/user-attachments/files/27962285/ai_coach.py)
-"""
-AI 跑步教练 —— 使用 Claude API + COROS 完整生理数据
-"""
-import json
-import os
-from anthropic import Anthropic
-
-
-def analyze_single_run(run_summary: dict, hr_zones_data: dict,
-                       profile: dict = None, evolab: dict = None) -> str:
-    client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-    prompt = _build_single_prompt(run_summary, hr_zones_data, profile, evolab)
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
-        system=_coach_system_prompt(),
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text_blocks = [b for b in resp.content if getattr(b, "type", None) == "text"]
-    return text_blocks[0].text if text_blocks else str(resp.content)
-
-
-def analyze_trends(trends: dict, recent_runs: list, profile: dict = None) -> str:
-    client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-    prompt = _build_trends_prompt(trends, recent_runs, profile)
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=3072,
-        system=_coach_system_prompt(),
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text_blocks = [b for b in resp.content if getattr(b, "type", None) == "text"]
-    return text_blocks[0].text if text_blocks else str(resp.content)
-
-
-def _coach_system_prompt():
-    return (
-        "你是一名精通运动生理学的专业跑步教练（NSCA-CSCS认证级别）。分析时：\n"
-        "1. 基于跑者的真实生理数据（VO2max、心率区间、HRV、训练负荷）给出判断\n"
-        "2. 所有建议必须可量化（具体配速、心率值、距离、频率）\n"
-        "3. 先肯定做得好的地方，再指优化点\n"
-        "4. 用中文，简洁有力，不要废话\n"
-        "5. 伤病风险明确警告"
-    )
-
-
-def _build_single_prompt(s: dict, hr_zones_data: dict,
-                         profile: dict, evolab: dict) -> str:
-    parts = []
-
-    # === 跑者档案 ===
-    if profile:
-        parts.append("## 跑者生理档案")
-        parts.append(f"- 安静心率: {profile.get('rhr')} bpm | 最大心率: {profile.get('max_hr')} bpm")
-        parts.append(f"- VO2max: {profile.get('vo2max')} ml/kg/min")
-        parts.append(f"- 乳酸阈值心率(LTHR): {profile.get('lthr')} bpm | LT配速: {profile.get('ltsp')}")
-        parts.append(f"- HRV基线: {profile.get('hrv_baseline')}ms | 当前HRV: {profile.get('hrv_latest')}ms")
-        parts.append(f"- 恢复状态: {profile.get('recovery_pct')}% | 体力等级: {profile.get('stamina_level')}")
-        parts.append(f"- 有氧耐力分: {profile.get('aerobic_endurance')} | 阈能力分: {profile.get('lactate_threshold_capacity')}")
-        if profile.get("hr_zones"):
-            parts.append("- COROS心率区间:")
-            for z in profile["hr_zones"]:
-                parts.append(f"  Z{z.get('index', '')+1 if z.get('index') is not None else ''}: "
-                             f"{z.get('hr')}bpm ({z.get('ratio')}%)")
-
-    # === 本次跑步 ===
-    parts.append("\n## 本次跑步数据")
-    parts.append(f"- 距离: {s.get('distance_km')} km | 时长: {s.get('duration_min')} 分钟")
-    parts.append(f"- 平均配速: {s.get('pace_min_per_km')}/km")
-    parts.append(f"- 平均心率: {s.get('avg_hr_bpm')} bpm | 最大心率: {s.get('max_hr_bpm')} bpm")
-    parts.append(f"- 步频: {s.get('avg_cadence')} | 步幅: {s.get('avg_stride_length_cm')} cm")
-    if s.get("avg_vertical_oscillation_mm"):
-        parts.append(f"- 垂直振幅: {s['avg_vertical_oscillation_mm']}mm | 触地时间: {s.get('avg_ground_time_ms')}ms")
-    if s.get("avg_power_w"):
-        parts.append(f"- 平均功率: {s['avg_power_w']}W")
-    if s.get("training_load"):
-        parts.append(f"- 训练负荷: {s['training_load']}")
-
-    # 心率区间
-    if hr_zones_data:
-        parts.append("\n## 本次心率区间分布")
-        for zone, data in hr_zones_data.items():
-            parts.append(f"- {zone}: {data['pct']}%")
-
-    # 近7天趋势
-    if profile and profile.get("trend_7d"):
-        parts.append("\n## 近7天训练趋势")
-        for d in profile["trend_7d"]:
-            parts.append(f"  {d['date']}: load={d['load']}, tired={d['tired']}%, perf={d['perf']}, RHR={d['rhr']}")
-
-    parts.append("\n## 请分析")
-    parts.append("1. 结合跑者的VO2max({}ml/kg/min)和乳酸阈值心率({}bpm)，这次训练在什么强度区间？是否合理？".format(
-        profile.get("vo2max", "?") if profile else "?", profile.get("lthr", "?") if profile else "?"))
-    parts.append("2. 心率-配速匹配度如何？心率漂移是否有问题？")
-    parts.append("3. 步频和跑姿效率（垂直振幅、触地时间）如何？")
-    parts.append("4. 结合HRV({}ms)和恢复状态({}%)，接下来应该做什么训练？".format(
-        profile.get("hrv_latest", "?") if profile else "?",
-        profile.get("recovery_pct", "?") if profile else "?"))
-    parts.append("5. 有没有伤病隐患？")
-
-    return "\n".join(parts)
-
-
-def _build_trends_prompt(trends: dict, recent_runs: list, profile: dict) -> str:
-    parts = []
-
-    # 档案
-    if profile:
-        parts.append("## 跑者生理档案")
-        parts.append(f"VO2max: {profile.get('vo2max')} | RHR: {profile.get('rhr')} | MaxHR: {profile.get('max_hr')}")
-        parts.append(f"LTHR: {profile.get('lthr')} | 体力: {profile.get('stamina_level')}")
-        parts.append(f"HRV: {profile.get('hrv_baseline')}→{profile.get('hrv_latest')} | 恢复: {profile.get('recovery_pct')}%")
-        parts.append(f"有氧耐力: {profile.get('aerobic_endurance')} | 无氧能力: {profile.get('anaerobic_capacity')} | 阈能力: {profile.get('lactate_threshold_capacity')}")
-        if profile.get("trend_7d"):
-            parts.append("近7天: " + " | ".join(
-                f"{d['date'][-4:]}: load={d['load']} tired={d['tired']}% RHR={d['rhr']}"
-                for d in profile["trend_7d"]))
-
-    # 趋势统计
-    parts.append(f"\n## 30次跑步趋势")
-    parts.append(f"总次数: {trends.get('total_runs')} | 平均距离: {trends.get('avg_distance_km')}km")
-    parts.append(f"平均配速: {trends.get('avg_pace_min_per_km')}/km | 最佳配速: {trends.get('best_pace')}/km")
-    parts.append(f"最长: {trends.get('longest_run_km')}km | 平均心率: {trends.get('avg_hr_bpm')}bpm")
-    weeks = trends.get("weekly_summary", {})
-    if weeks:
-        parts.append("周统计:")
-        for wk, data in sorted(weeks.items()):
-            parts.append(f"  {wk}: {data['runs']}次/{data['distance']:.1f}km/{data['duration']:.0f}min")
-
-    # 最近列表
-    parts.append("\n## 最近记录")
-    for r in recent_runs[:20]:
-        parts.append(f"- {r.get('start_time', '?')[:10]}: {r.get('distance_km')}km "
-                     f"配速{r.get('pace_min_per_km')}/km 心率{r.get('avg_hr_bpm')}bpm "
-                     f"步频{r.get('avg_cadence')} 负荷{r.get('training_load')}")
-
-    parts.append("\n## 请分析")
-    parts.append("1. 结合VO2max({})和乳酸阈值({}bpm)，当前训练强度分布是否合理？".format(
-        profile.get("vo2max", "?") if profile else "?", profile.get("lthr", "?") if profile else "?"))
-    parts.append("2. 训练负荷趋势如何？是否有过度训练或训练不足？")
-    parts.append("3. 有氧/无氧/阈值三项能力分是否均衡？需要重点补哪项？")
-    parts.append("4. 给出接下来2-4周的周期化训练计划（含具体配速、心率、距离）")
-    parts.append("5. 基于HRV和恢复数据，是否需要调整训练量？")
-
-    return "\n".join(parts)
+该文件是一个基于 SQLite 的本地跑步数据管理模块，核心用于跑步数据的存储、查询和趋势分析，以下是详细总结：
+一、核心定位
+实现本地跑步数据的持久化存储（SQLite），提供数据增改、查询、趋势统计等核心能力。
+二、基础配置与初始化
+路径配置：定义数据库文件路径DB_PATH（位于当前目录下data/runs.db），自动创建数据目录。
+数据库连接：get_db()函数负责创建 / 连接数据库，启用 WAL 日志模式提升读写性能，设置行工厂为字典格式，并触发表初始化。
+表结构初始化：_init_tables()通过 SQL 脚本创建两张核心表：
+runs（跑步主表）：主键为label_id，包含运动类型、开始时间、时长、距离、配速、心率、步频、卡路里、爬升 / 下降、功率、训练负荷 / 效果等维度，还存储 JSON 格式的evolab_data（进阶数据）和summary_json（汇总数据），以及数据创建时间。
+hr_zones（心率区间表）：关联runs表的label_id，存储心率区间名称、计数、占比，含外键约束；同时为runs表的start_time创建降序索引，优化时间维度查询性能。
+三、核心功能函数
+表格
+函数名	功能描述
+save_run	新增 / 替换跑步数据：先写入runs表，删除该label_id下旧的心率区间数据，再插入新心率区间数据，最后提交事务。
+get_run	根据label_id查询单条跑步数据，返回字典格式（无数据则返回 None）。
+get_recent_runs	查询最近 N 条（默认 30）跑步数据，按start_time降序排列，返回字典列表。
+get_trends	统计跑步趋势：取最近 100 条数据，计算总跑量、平均距离 / 配速 / 心率、最佳配速、最长跑步距离，以及按 “年月” 维度汇总的周度跑步次数、总距离、总时长。
+四、数据处理特点
+复杂数据（evolab_data、summary）通过json.dumps序列化后存储，保证结构化数据的持久化；
+数据库查询结果转为字典格式，简化数据读取和使用；
+心率区间数据采用 “先删后插” 策略，保证label_id关联数据的一致性。
+五、核心场景
+支持单条跑步数据的增改查、近期数据列表查询，以及跑步趋势（如配速 / 心率变化、月度跑量汇总）的统计分析，为跑步数据可视化、复盘提供数据支撑。
